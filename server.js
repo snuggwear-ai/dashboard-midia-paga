@@ -376,7 +376,7 @@ async function getAdEntities(query, filters) {
 }
 
 function isMcpAuthenticationError(error) {
-  return /Authentication Required|Failed to authenticate MCP|HTTP 401|status\\\":401|authorization|token/i.test(error.message || "");
+  return /Authentication Required|Failed to authenticate MCP|HTTP 401|status.*401|authorization|token/i.test(error.message || "");
 }
 
 async function getGraphInsights(filters) {

@@ -6,21 +6,28 @@ const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
 const MCP_URL = process.env.META_ADS_MCP_URL || "https://mcp.facebook.com/ads";
 const MCP_TOKEN = process.env.META_ADS_MCP_TOKEN || process.env.META_ADS_ACCESS_TOKEN || "";
+const GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || "v23.0";
+const GRAPH_API_URL = process.env.META_GRAPH_API_URL || `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const META_AD_ACCOUNT_ID = process.env.META_ADS_ACCOUNT_ID || "4437833576442216";
 const META_AD_ACCOUNT_NAME = process.env.META_ADS_ACCOUNT_NAME || "Snugg NOVA";
 const ROOT = __dirname;
 
-const TOP_CREATIVES_SINCE = process.env.TOP_CREATIVES_SINCE || "2026-06-01";
-const TOP_CREATIVES_UNTIL = process.env.TOP_CREATIVES_UNTIL || "2026-06-16";
-const TOP_CREATIVES_MIN_SPEND = Number(process.env.TOP_CREATIVES_MIN_SPEND || 100);
-const TOP_CREATIVES_MIN_PURCHASES = Number(process.env.TOP_CREATIVES_MIN_PURCHASES || 3);
-const TOP_CREATIVES_LIMIT = Number(process.env.TOP_CREATIVES_LIMIT || 100);
+const DEFAULT_TOP_CREATIVES = {
+  since: process.env.TOP_CREATIVES_SINCE || "2026-06-01",
+  until: process.env.TOP_CREATIVES_UNTIL || "2026-06-16",
+  minimumSpend: Number(process.env.TOP_CREATIVES_MIN_SPEND || 100),
+  minimumPurchases: Number(process.env.TOP_CREATIVES_MIN_PURCHASES || 3),
+  limit: Number(process.env.TOP_CREATIVES_LIMIT || 100),
+  sort: "purchases_roas",
+  status: "all"
+};
 const TOP_CREATIVE_FIELDS = [
   "id",
   "name",
   "campaign_id",
   "adset_id",
   "creative_id",
+  "status",
   "amount_spent",
   "actions:omni_purchase",
   "purchase_roas",
@@ -74,13 +81,15 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, {
         configured: Boolean(MCP_TOKEN),
         mcpUrl: MCP_URL,
+        graphApiUrl: GRAPH_API_URL,
         session: Boolean(sessionId)
       });
       return;
     }
 
     if (url.pathname === "/api/meta-ads/top-creatives") {
-      const result = await getTopCreatives();
+      const filters = normalizeTopCreativeFilters(url.searchParams);
+      const result = await getTopCreatives(filters);
       sendJson(response, result);
       return;
     }
@@ -173,6 +182,36 @@ async function postMcp(payload) {
   return data;
 }
 
+async function graphFetch(endpoint, params = {}) {
+  if (!MCP_TOKEN) {
+    throw new Error("Configure META_ADS_MCP_TOKEN antes de chamar o Meta Ads.");
+  }
+
+  const url = new URL(`${GRAPH_API_URL}${endpoint}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, value);
+    }
+  });
+
+  const response = await fetch(url, {
+    headers: {
+      "accept": "application/json",
+      "authorization": `Bearer ${MCP_TOKEN}`
+    }
+  });
+
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+
+  if (!response.ok || data?.error) {
+    const message = data?.error?.message || text || `Meta Graph API retornou HTTP ${response.status}.`;
+    throw new Error(formatMetaError(message));
+  }
+
+  return data;
+}
+
 function parseMcpBody(text, contentType) {
   if (!text) return null;
   if (contentType.includes("text/event-stream")) {
@@ -188,49 +227,124 @@ function normalizeMcpResult(payload) {
   return payload?.result ?? payload;
 }
 
-async function getTopCreatives() {
+function formatMetaError(message) {
+  const clean = stringifyValue(message);
+  if (/ads_management|ads_read|Ad account owner/i.test(clean)) {
+    return "O token foi reconhecido, mas a conta de anúncios ainda não liberou permissão ads_read ou ads_management para consultar performance. Libere essa permissão no Meta Business/App e gere um novo token.";
+  }
+
+  if (/Invalid OAuth|OAuthException|Session has expired|Error validating access token/i.test(clean)) {
+    return "O token do Meta está inválido ou expirado. Gere um novo token com acesso à conta de anúncios.";
+  }
+
+  return clean;
+}
+
+async function getTopCreatives(filters) {
   const query = {
-    ad_account_id: META_AD_ACCOUNT_ID,
+    ad_account_id: filters.accountId,
     level: "ad",
-    time_range: JSON.stringify({ since: TOP_CREATIVES_SINCE, until: TOP_CREATIVES_UNTIL }),
+    time_range: JSON.stringify({ since: filters.since, until: filters.until }),
     fields: TOP_CREATIVE_FIELDS,
-    filtering: [
-      { field: "amount_spent", operator: "GREATER_THAN", value: [String(TOP_CREATIVES_MIN_SPEND)] },
-      { field: "actions:omni_purchase", operator: "GREATER_THAN_OR_EQUAL", value: [String(TOP_CREATIVES_MIN_PURCHASES)] }
-    ],
-    sort: "actions:omni_purchase_descending",
-    limit: TOP_CREATIVES_LIMIT
+    filtering: buildTopCreativeMetaFilters(filters),
+    sort: metaSortFor(filters.sort),
+    limit: filters.limit
   };
 
-  const rawPayload = await getAdEntitiesWithFallback(query);
+  const rawPayload = await getAdEntities(query, filters);
   const rows = extractRows(rawPayload);
   const items = rows
     .map(normalizeCreativeRow)
-    .filter((item) => item.amount_spent > TOP_CREATIVES_MIN_SPEND && item.purchases >= TOP_CREATIVES_MIN_PURCHASES)
-    .sort(compareCreatives)
+    .filter((item) => passesTopCreativeFilters(item, filters))
+    .sort(compareCreativesFor(filters.sort))
     .slice(0, 5);
-  const enrichedItems = await enrichTopCreatives(items);
+  const enrichedItems = await enrichTopCreatives(items, filters.accountId);
 
   return {
     account: {
-      id: META_AD_ACCOUNT_ID,
-      name: META_AD_ACCOUNT_NAME,
+      id: filters.accountId,
+      name: filters.accountId === META_AD_ACCOUNT_ID ? META_AD_ACCOUNT_NAME : `Conta ${filters.accountId}`,
       currency: "BRL"
     },
     period: {
-      since: TOP_CREATIVES_SINCE,
-      until: TOP_CREATIVES_UNTIL,
-      label: formatDateRange(TOP_CREATIVES_SINCE, TOP_CREATIVES_UNTIL)
+      since: filters.since,
+      until: filters.until,
+      label: formatDateRange(filters.since, filters.until)
     },
     fields: TOP_CREATIVE_FIELDS,
     filters: {
-      minimumSpend: TOP_CREATIVES_MIN_SPEND,
-      minimumPurchases: TOP_CREATIVES_MIN_PURCHASES
+      minimumSpend: filters.minimumSpend,
+      minimumPurchases: filters.minimumPurchases,
+      campaignId: filters.campaignId,
+      adsetId: filters.adsetId,
+      status: filters.status
     },
-    sort: ["purchases_desc", "purchase_roas_desc", "cpa_asc"],
+    sort: sortLabel(filters.sort),
     generatedAt: new Date().toISOString(),
     items: enrichedItems
   };
+}
+
+function normalizeTopCreativeFilters(params) {
+  const filters = {
+    accountId: normalizeId(params.get("accountId")) || META_AD_ACCOUNT_ID,
+    since: normalizeDateParam(params.get("since"), DEFAULT_TOP_CREATIVES.since, "Data inicial inválida."),
+    until: normalizeDateParam(params.get("until"), DEFAULT_TOP_CREATIVES.until, "Data final inválida."),
+    campaignId: normalizeId(params.get("campaignId")),
+    adsetId: normalizeId(params.get("adsetId")),
+    minimumSpend: normalizeNumberParam(params.get("minimumSpend"), DEFAULT_TOP_CREATIVES.minimumSpend, 0, 10000000),
+    minimumPurchases: normalizeNumberParam(params.get("minimumPurchases"), DEFAULT_TOP_CREATIVES.minimumPurchases, 0, 1000000),
+    limit: normalizeNumberParam(params.get("limit"), DEFAULT_TOP_CREATIVES.limit, 5, 500),
+    sort: normalizeEnumParam(params.get("sort"), ["purchases_roas", "roas", "cpa", "spend"], DEFAULT_TOP_CREATIVES.sort),
+    status: normalizeEnumParam(params.get("status"), ["all", "active", "inactive", "delivery_issue"], DEFAULT_TOP_CREATIVES.status)
+  };
+
+  if (filters.since > filters.until) {
+    throw new Error("A data inicial precisa ser anterior ou igual à data final.");
+  }
+
+  return filters;
+}
+
+function buildTopCreativeMetaFilters(filters) {
+  const metaFilters = [
+    { field: "amount_spent", operator: "GREATER_THAN", value: [String(filters.minimumSpend)] },
+    { field: "actions:omni_purchase", operator: "GREATER_THAN_OR_EQUAL", value: [String(filters.minimumPurchases)] }
+  ];
+
+  if (filters.campaignId) {
+    metaFilters.push({ field: "campaign_id", operator: "IN", value: [filters.campaignId] });
+  }
+
+  if (filters.adsetId) {
+    metaFilters.push({ field: "adset_id", operator: "IN", value: [filters.adsetId] });
+  }
+
+  return metaFilters;
+}
+
+function passesTopCreativeFilters(item, filters) {
+  if (item.amount_spent < filters.minimumSpend) return false;
+  if (item.purchases < filters.minimumPurchases) return false;
+  if (filters.campaignId && item.campaign_id !== filters.campaignId) return false;
+  if (filters.adsetId && item.adset_id !== filters.adsetId) return false;
+
+  const delivery = item.delivery.toLowerCase();
+  const status = item.status.toLowerCase();
+  const isInactive = /inactive|paused|deleted|archived|off|not_delivering/.test(`${status} ${delivery}`);
+  const hasDeliveryIssue = /error|rejected|limited|not_delivering|inactive|off/.test(`${status} ${delivery}`);
+
+  if (filters.status === "active") return !isInactive;
+  if (filters.status === "inactive") return isInactive;
+  if (filters.status === "delivery_issue") return hasDeliveryIssue;
+  return true;
+}
+
+function metaSortFor(sort) {
+  if (sort === "roas") return "purchase_roas_descending";
+  if (sort === "cpa") return "cost_per_result_ascending";
+  if (sort === "spend") return "amount_spent_descending";
+  return "actions:omni_purchase_descending";
 }
 
 async function getAdEntitiesWithFallback(query) {
@@ -252,13 +366,101 @@ async function getAdEntitiesWithFallback(query) {
   throw lastError;
 }
 
-async function enrichTopCreatives(items) {
+async function getAdEntities(query, filters) {
+  try {
+    return await getAdEntitiesWithFallback(query);
+  } catch (error) {
+    if (!isMcpAuthenticationError(error)) throw error;
+    return getGraphInsights(filters);
+  }
+}
+
+function isMcpAuthenticationError(error) {
+  return /Authentication Required|Failed to authenticate MCP|HTTP 401|status\\\":401|authorization|token/i.test(error.message || "");
+}
+
+async function getGraphInsights(filters) {
+  const params = {
+    level: "ad",
+    time_range: JSON.stringify({ since: filters.since, until: filters.until }),
+    fields: [
+      "ad_id",
+      "ad_name",
+      "campaign_id",
+      "adset_id",
+      "spend",
+      "actions",
+      "purchase_roas",
+      "cost_per_action_type",
+      "ctr",
+      "cpc",
+      "cpm",
+      "impressions",
+      "reach"
+    ].join(","),
+    filtering: JSON.stringify(buildGraphInsightFilters(filters)),
+    sort: metaSortFor(filters.sort),
+    limit: String(filters.limit)
+  };
+
+  const payload = await graphFetch(`/act_${filters.accountId}/insights`, params);
+  return {
+    data: normalizeArray(payload?.data).map((row) => ({
+      id: stringifyValue(row.ad_id),
+      name: stringifyValue(row.ad_name),
+      campaign_id: stringifyValue(row.campaign_id),
+      adset_id: stringifyValue(row.adset_id),
+      creative_id: "",
+      amount_spent: row.spend,
+      "actions:omni_purchase": findActionValue(row.actions, "omni_purchase") || findActionValue(row.actions, "purchase"),
+      purchase_roas: findActionValue(row.purchase_roas, "omni_purchase") || findActionValue(row.purchase_roas, "purchase"),
+      cost_per_result:
+        findActionValue(row.cost_per_action_type, "omni_purchase") || findActionValue(row.cost_per_action_type, "purchase"),
+      ctr: row.ctr,
+      cpc: row.cpc,
+      cpm: row.cpm,
+      impressions: row.impressions,
+      reach: row.reach,
+      delivery: "",
+      status: ""
+    }))
+  };
+}
+
+function buildGraphInsightFilters(filters) {
+  const graphFilters = [];
+
+  if (filters.campaignId) {
+    graphFilters.push({ field: "campaign.id", operator: "IN", value: [filters.campaignId] });
+  }
+
+  if (filters.adsetId) {
+    graphFilters.push({ field: "adset.id", operator: "IN", value: [filters.adsetId] });
+  }
+
+  return graphFilters;
+}
+
+async function enrichTopCreatives(items, accountId) {
   if (!items.length) return [];
 
-  const creativeDetails = await getCreativeDetails(items.map((item) => item.creative_id).filter(Boolean));
+  const adDetails = await getAdDetails(items.map((item) => item.id).filter(Boolean));
+  const normalizedItems = items.map((item) => {
+    const ad = adDetails.get(item.id) || {};
+    const creative = ad.creative || {};
+    return {
+      ...item,
+      status: item.status || stringifyValue(ad.status || ad.effective_status),
+      delivery: item.delivery || stringifyValue(ad.effective_status || ad.status),
+      creative_id: item.creative_id || stringifyValue(creative.id),
+      preview_url: item.preview_url || stringifyValue(ad.preview_shareable_link)
+    };
+  });
+  const creativeDetails = await getCreativeDetails(accountId, normalizedItems.map((item) => item.creative_id).filter(Boolean));
   return Promise.all(
-    items.map(async (item) => {
-      const creative = creativeDetails.get(item.creative_id) || {};
+    normalizedItems.map(async (item) => {
+      const ad = adDetails.get(item.id) || {};
+      const creative = creativeDetails.get(item.creative_id) || ad.creative || {};
       const preview = await getCreativePreview(item, creative);
       const imageUrl = firstValue(
         preview.image_url,
@@ -277,7 +479,7 @@ async function enrichTopCreatives(items) {
         title: stringifyValue(creative.title),
         link_url: stringifyValue(creative.link_url),
         image_url: stringifyValue(imageUrl),
-        preview_url: stringifyValue(previewUrl),
+        preview_url: stringifyValue(previewUrl || item.preview_url),
         preview_format: stringifyValue(preview.ad_format_label || preview.ad_format),
         instagram_media_id: stringifyValue(creative.effective_instagram_media_id),
         object_story_id: stringifyValue(creative.effective_object_story_id || creative.object_story_id)
@@ -286,13 +488,34 @@ async function enrichTopCreatives(items) {
   );
 }
 
-async function getCreativeDetails(creativeIds) {
+async function getAdDetails(adIds) {
+  const uniqueIds = [...new Set(adIds)].filter(Boolean).slice(0, 5);
+  if (!uniqueIds.length) return new Map();
+
+  const entries = await Promise.all(
+    uniqueIds.map(async (adId) => {
+      try {
+        const payload = await graphFetch(`/${adId}`, {
+          fields:
+            "id,name,status,effective_status,preview_shareable_link,creative{id,name,status,body,title,link_url,image_url,thumbnail_url,video_id,call_to_action_type,object_story_id,effective_object_story_id,effective_instagram_media_id}"
+        });
+        return [stringifyValue(payload.id), payload];
+      } catch (error) {
+        return [adId, {}];
+      }
+    })
+  );
+
+  return new Map(entries);
+}
+
+async function getCreativeDetails(accountId, creativeIds) {
   const uniqueIds = [...new Set(creativeIds)].filter(Boolean);
   if (!uniqueIds.length) return new Map();
 
   try {
     const payload = await callMcpTool("ads_get_creatives", {
-      ad_account_id: META_AD_ACCOUNT_ID,
+      ad_account_id: accountId,
       creative_ids: uniqueIds,
       fields: CREATIVE_DETAIL_FIELDS
     });
@@ -405,6 +628,7 @@ function normalizeCreativeRow(row) {
     campaign_id: stringifyValue(row.campaign_id),
     adset_id: stringifyValue(row.adset_id),
     creative_id: stringifyValue(row.creative_id),
+    status: stringifyValue(row.status),
     amount_spent: roundMetric(amountSpent),
     purchases: roundMetric(purchases, 0),
     purchase_roas: roundMetric(roas),
@@ -529,9 +753,55 @@ function stringifyValue(value) {
   return value == null ? "" : String(value);
 }
 
+function normalizeId(value) {
+  const clean = stringifyValue(value).trim().replace(/^act_/i, "");
+  return /^\d+$/.test(clean) ? clean : "";
+}
+
+function normalizeDateParam(value, fallback, message) {
+  const clean = stringifyValue(value || fallback).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+    throw new Error(message);
+  }
+
+  const date = new Date(`${clean}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== clean) {
+    throw new Error(message);
+  }
+
+  return clean;
+}
+
+function normalizeNumberParam(value, fallback, min, max) {
+  const number = value == null || value === "" ? fallback : Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+function normalizeEnumParam(value, allowedValues, fallback) {
+  const clean = stringifyValue(value).trim();
+  return allowedValues.includes(clean) ? clean : fallback;
+}
+
 function roundMetric(value, fractionDigits = 2) {
   const number = Number(value || 0);
   return Number(number.toFixed(fractionDigits));
+}
+
+function compareCreativesFor(sort) {
+  if (sort === "roas") {
+    return (a, b) => b.purchase_roas - a.purchase_roas || b.purchases - a.purchases || a.cpa - b.cpa;
+  }
+
+  if (sort === "cpa") {
+    return (a, b) => a.cpa - b.cpa || b.purchases - a.purchases || b.purchase_roas - a.purchase_roas;
+  }
+
+  if (sort === "spend") {
+    return (a, b) => b.amount_spent - a.amount_spent || b.purchases - a.purchases || b.purchase_roas - a.purchase_roas;
+  }
+
+  return compareCreatives;
 }
 
 function compareCreatives(a, b) {
@@ -541,6 +811,13 @@ function compareCreatives(a, b) {
     a.cpa - b.cpa ||
     b.amount_spent - a.amount_spent
   );
+}
+
+function sortLabel(sort) {
+  if (sort === "roas") return ["purchase_roas_desc", "purchases_desc", "cpa_asc"];
+  if (sort === "cpa") return ["cpa_asc", "purchases_desc", "purchase_roas_desc"];
+  if (sort === "spend") return ["amount_spent_desc", "purchases_desc", "purchase_roas_desc"];
+  return ["purchases_desc", "purchase_roas_desc", "cpa_asc"];
 }
 
 function classifyCreative(item) {

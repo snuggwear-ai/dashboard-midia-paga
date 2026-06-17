@@ -563,6 +563,13 @@ th:nth-child(3) {
   border-color: rgba(164, 92, 19, 0.2);
 }
 
+.top-creatives-state.ready {
+  min-height: 0;
+  color: #245044;
+  background: rgba(10, 124, 102, 0.08);
+  border-color: rgba(10, 124, 102, 0.18);
+}
+
 .loading-dot {
   width: 10px;
   height: 10px;
@@ -574,8 +581,8 @@ th:nth-child(3) {
 
 .top-creatives-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(180px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
 }
 
 .creative-card {
@@ -583,7 +590,7 @@ th:nth-child(3) {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  min-height: 360px;
+  min-height: 520px;
   padding: 16px;
   background: #f5f5f7;
   border: 1px solid rgba(0, 0, 0, 0.08);
@@ -630,9 +637,73 @@ th:nth-child(3) {
   background: rgba(187, 74, 105, 0.12);
 }
 
+.creative-preview {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 4 / 5;
+  overflow: hidden;
+  background: #e8e8ed;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+}
+
+.creative-preview img,
+.creative-preview iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  object-fit: cover;
+}
+
+.creative-preview > span,
+.creative-preview > a {
+  position: absolute;
+  inset: auto 10px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 12px;
+  background: rgba(17, 17, 20, 0.86);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 760;
+  text-align: center;
+}
+
+.creative-preview.iframe-preview > a {
+  inset: 0;
+  border-radius: 8px;
+  background: rgba(17, 17, 20, 0.18);
+  align-items: flex-end;
+  padding-bottom: 10px;
+}
+
+.creative-preview.iframe-preview > a::after {
+  content: "Visualizar criativo";
+  min-height: 34px;
+  padding: 10px 12px;
+  background: rgba(17, 17, 20, 0.86);
+  border-radius: 999px;
+}
+
+.creative-preview.iframe-preview > a {
+  font-size: 0;
+}
+
+.creative-preview.empty-preview {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 760;
+}
+
 .creative-card h3 {
   margin: 0;
-  min-height: 64px;
+  min-height: 58px;
   color: var(--text);
   font-size: 17px;
   line-height: 1.18;

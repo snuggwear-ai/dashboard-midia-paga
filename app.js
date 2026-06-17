@@ -375,7 +375,7 @@
       }
 
       const payload = await fetchJson("/api/meta-ads/top-creatives");
-      renderTopCreatives(payload.items || []);
+      renderTopCreatives(payload.items || [], payload);
     } catch (error) {
       renderTopCreativesError(error);
     } finally {
@@ -383,7 +383,7 @@
     }
   }
 
-  function renderTopCreatives(items) {
+  function renderTopCreatives(items, payload = {}) {
     const grid = document.getElementById("topCreativesGrid");
     const state = document.getElementById("topCreativesState");
     if (!grid || !state) return;
@@ -396,7 +396,9 @@
       return;
     }
 
-    state.hidden = true;
+    state.hidden = false;
+    state.className = "top-creatives-state ready";
+    state.innerHTML = `<p>${escapeHtml(topCreativesSummary(payload))}</p>`;
     grid.innerHTML = items
       .map(
         (item, index) => `
@@ -405,6 +407,7 @@
               <span class="creative-rank">#${index + 1}</span>
               <span class="creative-badge ${badgeClass(item.badge)}">${escapeHtml(item.badge)}</span>
             </div>
+            ${renderCreativePreview(item)}
             <h3>${escapeHtml(item.name || "Criativo sem nome")}</h3>
             <dl class="creative-stats">
               <div>
@@ -440,6 +443,51 @@
         `
       )
       .join("");
+  }
+
+  function topCreativesSummary(payload) {
+    const period = payload.period?.label || "01/06/2026 a 16/06/2026";
+    const account = payload.account?.name || "Snugg NOVA";
+    return `Conta ${account} · Período ${period} · clique no preview para visualizar o criativo.`;
+  }
+
+  function renderCreativePreview(item) {
+    const previewUrl = safeExternalUrl(item.preview_url);
+    const clickUrl = safeExternalUrl(item.preview_url || item.link_url);
+    const imageUrl = safeImageUrl(item.image_url);
+    const title = item.title || item.creative_name || item.name || "Criativo";
+
+    if (imageUrl) {
+      return `
+        <a class="creative-preview" href="${escapeHtml(clickUrl || imageUrl)}" target="_blank" rel="noopener noreferrer" aria-label="Visualizar criativo ${escapeHtml(title)}">
+          <img src="${escapeHtml(imageUrl)}" alt="${escapeHtml(title)}" loading="lazy" />
+          <span>Visualizar criativo</span>
+        </a>
+      `;
+    }
+
+    if (previewUrl) {
+      return `
+        <div class="creative-preview iframe-preview">
+          <iframe src="${escapeHtml(previewUrl)}" title="Preview do criativo ${escapeHtml(title)}" loading="lazy"></iframe>
+          <a href="${escapeHtml(previewUrl)}" target="_blank" rel="noopener noreferrer">Visualizar criativo</a>
+        </div>
+      `;
+    }
+
+    if (clickUrl) {
+      return `
+        <a class="creative-preview empty-preview" href="${escapeHtml(clickUrl)}" target="_blank" rel="noopener noreferrer">
+          <span>Visualizar criativo</span>
+        </a>
+      `;
+    }
+
+    return `
+      <div class="creative-preview empty-preview">
+        <span>Preview indisponível</span>
+      </div>
+    `;
   }
 
   function renderTopCreativesError(error) {
@@ -554,6 +602,22 @@
   function formatDelivery(value) {
     const delivery = String(value || "").replace(/_/g, " ").trim();
     return delivery || "--";
+  }
+
+  function safeExternalUrl(value) {
+    const url = String(value || "").trim();
+    if (!url) return "";
+    if (/^https:\/\/(business\.facebook\.com|www\.facebook\.com|facebook\.com|www\.instagram\.com|instagram\.com)\//i.test(url)) return url;
+    if (/^https?:\/\//i.test(url)) return url;
+    return "";
+  }
+
+  function safeImageUrl(value) {
+    const url = String(value || "").trim();
+    if (!url) return "";
+    if (/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(url)) return url;
+    if (/^https?:\/\//i.test(url)) return url;
+    return "";
   }
 
   function escapeHtml(value) {

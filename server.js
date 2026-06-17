@@ -10,6 +10,8 @@ const META_AD_ACCOUNT_ID = process.env.META_ADS_ACCOUNT_ID || "4437833576442216"
 const META_AD_ACCOUNT_NAME = process.env.META_ADS_ACCOUNT_NAME || "Snugg NOVA";
 const ROOT = __dirname;
 
+const TOP_CREATIVES_SINCE = process.env.TOP_CREATIVES_SINCE || "2026-06-01";
+const TOP_CREATIVES_UNTIL = process.env.TOP_CREATIVES_UNTIL || "2026-06-16";
 const TOP_CREATIVES_MIN_SPEND = Number(process.env.TOP_CREATIVES_MIN_SPEND || 100);
 const TOP_CREATIVES_MIN_PURCHASES = Number(process.env.TOP_CREATIVES_MIN_PURCHASES || 3);
 const TOP_CREATIVES_LIMIT = Number(process.env.TOP_CREATIVES_LIMIT || 100);
@@ -29,6 +31,25 @@ const TOP_CREATIVE_FIELDS = [
   "impressions",
   "reach",
   "delivery"
+];
+const CREATIVE_DETAIL_FIELDS = [
+  "id",
+  "name",
+  "status",
+  "account_id",
+  "object_type",
+  "body",
+  "title",
+  "link_url",
+  "image_hash",
+  "image_url",
+  "video_id",
+  "thumbnail_url",
+  "call_to_action_type",
+  "object_story_id",
+  "effective_object_story_id",
+  "effective_instagram_media_id",
+  "child_attachments"
 ];
 
 let sessionId = "";
@@ -171,7 +192,7 @@ async function getTopCreatives() {
   const query = {
     ad_account_id: META_AD_ACCOUNT_ID,
     level: "ad",
-    date_preset: "this_month",
+    time_range: JSON.stringify({ since: TOP_CREATIVES_SINCE, until: TOP_CREATIVES_UNTIL }),
     fields: TOP_CREATIVE_FIELDS,
     filtering: [
       { field: "amount_spent", operator: "GREATER_THAN", value: [String(TOP_CREATIVES_MIN_SPEND)] },
@@ -181,13 +202,14 @@ async function getTopCreatives() {
     limit: TOP_CREATIVES_LIMIT
   };
 
-  const rawPayload = await callMcpTool("ads_get_ad_entities", query);
+  const rawPayload = await getAdEntitiesWithFallback(query);
   const rows = extractRows(rawPayload);
   const items = rows
     .map(normalizeCreativeRow)
     .filter((item) => item.amount_spent > TOP_CREATIVES_MIN_SPEND && item.purchases >= TOP_CREATIVES_MIN_PURCHASES)
     .sort(compareCreatives)
     .slice(0, 5);
+  const enrichedItems = await enrichTopCreatives(items);
 
   return {
     account: {
@@ -195,7 +217,11 @@ async function getTopCreatives() {
       name: META_AD_ACCOUNT_NAME,
       currency: "BRL"
     },
-    period: "this_month",
+    period: {
+      since: TOP_CREATIVES_SINCE,
+      until: TOP_CREATIVES_UNTIL,
+      label: formatDateRange(TOP_CREATIVES_SINCE, TOP_CREATIVES_UNTIL)
+    },
     fields: TOP_CREATIVE_FIELDS,
     filters: {
       minimumSpend: TOP_CREATIVES_MIN_SPEND,
@@ -203,7 +229,98 @@ async function getTopCreatives() {
     },
     sort: ["purchases_desc", "purchase_roas_desc", "cpa_asc"],
     generatedAt: new Date().toISOString(),
-    items
+    items: enrichedItems
+  };
+}
+
+async function getAdEntitiesWithFallback(query) {
+  const attempts = [
+    query,
+    { ...query, sort: undefined },
+    { ...query, sort: undefined, filtering: undefined }
+  ];
+  let lastError;
+
+  for (const attempt of attempts) {
+    try {
+      return await callMcpTool("ads_get_ad_entities", compactObject(attempt));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError;
+}
+
+async function enrichTopCreatives(items) {
+  if (!items.length) return [];
+
+  const creativeDetails = await getCreativeDetails(items.map((item) => item.creative_id).filter(Boolean));
+  return Promise.all(
+    items.map(async (item) => {
+      const creative = creativeDetails.get(item.creative_id) || {};
+      const preview = await getCreativePreview(item, creative);
+      const imageUrl = firstValue(
+        preview.image_url,
+        preview.image_data_url,
+        creative.thumbnail_url,
+        creative.image_url,
+        firstAttachmentValue(creative.child_attachments, ["picture", "image_url", "thumbnail_url"])
+      );
+      const previewUrl = firstValue(preview.preview_url, creative.permalink_url, creative.link_url);
+
+      return {
+        ...item,
+        creative_name: stringifyValue(creative.name),
+        creative_status: stringifyValue(creative.status),
+        body: stringifyValue(creative.body),
+        title: stringifyValue(creative.title),
+        link_url: stringifyValue(creative.link_url),
+        image_url: stringifyValue(imageUrl),
+        preview_url: stringifyValue(previewUrl),
+        preview_format: stringifyValue(preview.ad_format_label || preview.ad_format),
+        instagram_media_id: stringifyValue(creative.effective_instagram_media_id),
+        object_story_id: stringifyValue(creative.effective_object_story_id || creative.object_story_id)
+      };
+    })
+  );
+}
+
+async function getCreativeDetails(creativeIds) {
+  const uniqueIds = [...new Set(creativeIds)].filter(Boolean);
+  if (!uniqueIds.length) return new Map();
+
+  try {
+    const payload = await callMcpTool("ads_get_creatives", {
+      ad_account_id: META_AD_ACCOUNT_ID,
+      creative_ids: uniqueIds,
+      fields: CREATIVE_DETAIL_FIELDS
+    });
+    return new Map(extractCreativeRows(payload).map((creative) => [stringifyValue(creative.id), creative]));
+  } catch (error) {
+    return new Map();
+  }
+}
+
+async function getCreativePreview(item, creative) {
+  const attempts = [
+    { ad_id: item.id, ad_format: "INSTAGRAM_STANDARD" },
+    { creative_id: item.creative_id, ad_format: "INSTAGRAM_STANDARD" },
+    { ad_id: item.id, ad_format: "MOBILE_FEED_STANDARD" },
+    { creative_id: item.creative_id, ad_format: "MOBILE_FEED_STANDARD" }
+  ].filter((attempt) => attempt.ad_id || attempt.creative_id);
+
+  for (const attempt of attempts) {
+    try {
+      return normalizePreviewPayload(await callMcpTool("ads_get_ad_preview", attempt));
+    } catch (error) {
+      // Keep the card useful even when one preview placement is unavailable.
+    }
+  }
+
+  return {
+    preview_url: creative.link_url || "",
+    image_url: creative.thumbnail_url || creative.image_url || ""
   };
 }
 
@@ -225,18 +342,25 @@ function parseToolPayload(payload) {
   if (result?.isError) {
     throw new Error(extractToolText(result) || "O MCP retornou erro ao consultar os anúncios.");
   }
-  if (result?.structuredContent) return result.structuredContent;
+  const images = extractToolImages(result);
+  if (result?.structuredContent) {
+    if (images.length && typeof result.structuredContent === "object") {
+      return { ...result.structuredContent, images };
+    }
+    return result.structuredContent;
+  }
 
   const text = extractToolText(result);
   if (text) {
     try {
-      return JSON.parse(text);
+      const parsed = JSON.parse(text);
+      return images.length && parsed && typeof parsed === "object" ? { ...parsed, images } : parsed;
     } catch (error) {
-      return { text };
+      return images.length ? { text, images } : { text };
     }
   }
 
-  return result;
+  return images.length ? { ...result, images } : result;
 }
 
 function extractToolText(result) {
@@ -255,6 +379,16 @@ function extractRows(payload) {
   if (Array.isArray(payload?.ad_entities)) return payload.ad_entities;
   if (Array.isArray(payload?.items)) return payload.items;
   if (payload?.result) return extractRows(payload.result);
+  return [];
+}
+
+function extractCreativeRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.ad_creatives)) return payload.ad_creatives;
+  if (Array.isArray(payload?.creatives)) return payload.creatives;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (payload?.result) return extractCreativeRows(payload.result);
   return [];
 }
 
@@ -282,6 +416,8 @@ function normalizeCreativeRow(row) {
     impressions: roundMetric(metricNumber(row.impressions), 0),
     reach: roundMetric(metricNumber(row.reach), 0),
     delivery: stringifyValue(row.delivery),
+    preview_url: "",
+    image_url: "",
     badge: ""
   };
 
@@ -318,6 +454,75 @@ function metricNumber(value) {
   const normalized = String(value).replace(/[^\d,.-]/g, "").replace(",", ".");
   const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizePreviewPayload(payload) {
+  const image = Array.isArray(payload?.images) ? payload.images[0] : null;
+  return {
+    preview_html: stringifyValue(payload?.preview_html),
+    preview_url: decodeHtmlEntities(payload?.preview_url),
+    ad_format: stringifyValue(payload?.ad_format),
+    ad_format_label: stringifyValue(payload?.ad_format_label),
+    image_data_url: image?.dataUrl || "",
+    image_url: stringifyValue(payload?.image_url || payload?.thumbnail_url)
+  };
+}
+
+function extractToolImages(result) {
+  if (!result?.content || !Array.isArray(result.content)) return [];
+  return result.content
+    .filter((item) => item?.type === "image" && item.data)
+    .map((item) => ({
+      mimeType: item.mimeType || "image/png",
+      dataUrl: `data:${item.mimeType || "image/png"};base64,${item.data}`
+    }));
+}
+
+function firstAttachmentValue(attachments, keys) {
+  const list = normalizeArray(attachments);
+  for (const attachment of list) {
+    for (const key of keys) {
+      if (attachment?.[key]) return attachment[key];
+    }
+  }
+  return "";
+}
+
+function normalizeArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string" && /^[\[{]/.test(value.trim())) {
+    try {
+      return normalizeArray(JSON.parse(value));
+    } catch (error) {
+      return [];
+    }
+  }
+  return typeof value === "object" ? [value] : [];
+}
+
+function firstValue(...values) {
+  return values.find((value) => value != null && String(value).trim() !== "") || "";
+}
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null));
+}
+
+function decodeHtmlEntities(value) {
+  return stringifyValue(value)
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'");
+}
+
+function formatDateRange(since, until) {
+  return `${formatDatePtBr(since)} a ${formatDatePtBr(until)}`;
+}
+
+function formatDatePtBr(value) {
+  const [year, month, day] = String(value).split("-");
+  return `${day}/${month}/${year}`;
 }
 
 function stringifyValue(value) {

@@ -55,6 +55,9 @@ a {
   align-items: center;
   width: clamp(156px, 15vw, 210px);
   min-width: 156px;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
 }
 
 .brand-logo {

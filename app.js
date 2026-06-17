@@ -72,6 +72,10 @@
 
   function bindTopCreatives() {
     document.getElementById("topCreativesRefresh")?.addEventListener("click", loadTopCreatives);
+    document.getElementById("topCreativesFilters")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      loadTopCreatives();
+    });
   }
 
   function render() {
@@ -374,7 +378,7 @@
         throw new Error("Abra o site pelo servidor local para carregar dados do Meta Ads.");
       }
 
-      const payload = await fetchJson("/api/meta-ads/top-creatives");
+      const payload = await fetchJson(`/api/meta-ads/top-creatives?${buildTopCreativesQuery()}`);
       renderTopCreatives(payload.items || [], payload);
     } catch (error) {
       renderTopCreativesError(error);
@@ -391,7 +395,7 @@
     if (!items.length) {
       state.hidden = false;
       state.className = "top-creatives-state empty";
-      state.innerHTML = `<p>Nenhum anúncio passou pelos filtros de investimento e vendas neste mês.</p>`;
+      state.innerHTML = `<p>Nenhum anúncio passou pelos filtros selecionados.</p>`;
       grid.innerHTML = "";
       return;
     }
@@ -434,6 +438,10 @@
                 <dt>Entrega</dt>
                 <dd>${escapeHtml(formatDelivery(item.delivery))}</dd>
               </div>
+              <div>
+                <dt>Status</dt>
+                <dd>${escapeHtml(formatDelivery(item.status || item.creative_status))}</dd>
+              </div>
             </dl>
             <div class="creative-meta">
               <span>ID ${escapeHtml(item.id || "--")}</span>
@@ -448,7 +456,23 @@
   function topCreativesSummary(payload) {
     const period = payload.period?.label || "01/06/2026 a 16/06/2026";
     const account = payload.account?.name || "Snugg NOVA";
-    return `Conta ${account} · Período ${period} · clique no preview para visualizar o criativo.`;
+    const generatedAt = payload.generatedAt ? ` · Atualizado ${formatDateTime(payload.generatedAt)}` : "";
+    const filters = payload.filters
+      ? ` · mín. ${formatValue(payload.filters.minimumSpend, "currency")} e ${formatValue(payload.filters.minimumPurchases, "integer")} vendas`
+      : "";
+    return `Conta ${account} · Período ${period}${filters}${generatedAt} · clique no preview para visualizar o criativo.`;
+  }
+
+  function buildTopCreativesQuery() {
+    const form = document.getElementById("topCreativesFilters");
+    const params = new URLSearchParams();
+    if (!form) return params.toString();
+
+    new FormData(form).forEach((value, key) => {
+      const clean = String(value || "").trim();
+      if (clean) params.set(key, clean);
+    });
+    return params.toString();
   }
 
   function renderCreativePreview(item) {
@@ -602,6 +626,18 @@
   function formatDelivery(value) {
     const delivery = String(value || "").replace(/_/g, " ").trim();
     return delivery || "--";
+  }
+
+  function formatDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
   }
 
   function safeExternalUrl(value) {
